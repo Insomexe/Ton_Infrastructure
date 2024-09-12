@@ -1,0 +1,384 @@
+#include "stdlib.fc";
+#include "job.fc";
+#include "consensus.fc";
+#include "storage.fc";
+
+;; Constants
+const int BOOST_ENERGY_COST = 1000;
+const int BOOST_CLICK_COST = 1000;
+const int INITIAL_ENERGY = 500;
+const int MAX_ENERGY = 1000;
+const int ENERGY_RECHARGE_INTERVAL = 10800; ;; 3 hours in seconds
+const int STAKE_DURATION = 183 * 24 * 60 * 60; ;; 7 months in seconds
+const int RESTRICTED_COOLDOWN = 2 * 7 * 24 * 60 * 60; ;; 2 weeks in seconds
+
+int not(int x) inline {
+    return 1 - x;
+}
+
+;; Data structure for contract storage
+global cell storage_data;
+
+() track_token_earning(slice userIP, int tokens) impure {
+    var cs = storage_data.begin_parse();
+    cell user_data = cs~load_ref();
+
+    int lastEarnTime = 0;
+    int earnedTokens = 0;
+
+    ;; Var olan veriyi tarayarak ilgili kullanıcıyı bul
+    if (not(is_empty_cell(user_data))) {
+        var parser = user_data.begin_parse();
+        while (not(parser.slice_empty?())) {
+            slice stored_ip = parser~load_slice();
+            earnedTokens = parser~load_uint(64);
+            lastEarnTime = parser~load_uint(32);
+
+            if (slice_hash(stored_ip) == slice_hash(userIP)) {
+                break;
+            }
+        }
+    }
+
+    int currentTime = now();
+    int elapsedTime = currentTime - lastEarnTime;
+
+    ;; Token kazanım hızını kontrol et
+    if (elapsedTime > 0) {
+        int earnedTokensInMillis = (earnedTokens + tokens) * 1000;
+        int limit = 600 * 1000; ;; 600 token/saniye limiti
+
+        if (earnedTokensInMillis / elapsedTime > limit) {
+            update_blacklist(userIP, 1); ;; Kara listeye ekle
+        } else {
+            earnedTokens += tokens;
+        }
+    } else {
+        earnedTokens = tokens;
+    }
+
+    ;; Kullanıcı verilerini güncelle
+    store_user_data(userIP, earnedTokens, currentTime);
+}
+
+
+() store_user_data(slice userIP, int earnedTokens, int lastEarnTime) impure {
+    var cs = storage_data.begin_parse();
+    cell user_data = cs~load_ref();
+    builder b = begin_cell();
+
+    ;; Eğer `user_data` boşsa, yeni bir cell oluştur ve veriyi sakla
+    if (is_empty_cell(user_data)) {
+        b.store_slice(userIP);
+        b.store_uint(earnedTokens, 64);
+        b.store_uint(lastEarnTime, 32);
+    } else {
+        var parser = user_data.begin_parse();
+        int found = 0;
+        
+        ;; Var olan kullanıcıyı arayarak veriyi güncelle
+        while (not(parser.slice_empty?())) {
+            slice stored_ip = parser~load_slice();
+            int stored_tokens = parser~load_uint(64);
+            int stored_time = parser~load_uint(32);
+            
+            ;; Eğer IP eşleşiyorsa veriyi güncelle
+            if (slice_hash(stored_ip) == slice_hash(userIP)) {
+                b.store_slice(userIP);
+                b.store_uint(earnedTokens, 64);
+                b.store_uint(lastEarnTime, 32);
+                found = 1;
+            } else {
+                ;; Eşleşmiyorsa mevcut veriyi olduğu gibi sakla
+                b.store_slice(stored_ip);
+                b.store_uint(stored_tokens, 64);
+                b.store_uint(stored_time, 32);
+            }
+        }
+        
+        ;; Eğer kullanıcı IP'si bulunmadıysa, yeni veriyi ekle
+        if (not(found)) {
+            b.store_slice(userIP);
+            b.store_uint(earnedTokens, 64);
+            b.store_uint(lastEarnTime, 32);
+        }
+    }
+
+    ;; Güncellenmiş veriyi storage'a kaydet
+    storage_data = begin_cell()
+        .store_slice(cs~load_slice())
+        .store_uint(cs~load_uint(32), 32)
+        .store_uint(cs~load_uint(64), 64)
+        .store_ref(b.end_cell()) ;; Güncellenmiş user_data
+        .store_uint(cs~load_uint(32), 32)
+        .store_ref(cs~load_ref())
+        .store_uint(cs~load_uint(32), 32)
+        .store_ref(cs~load_ref())
+        .end_cell();
+}
+
+
+;; Helper functions
+int current_time() inline {
+    return now(); ;; Use the built-in `now` function
+}
+
+int is_empty_cell(cell c) inline {
+    return slice_hash(c.begin_parse()) == slice_hash(begin_cell().end_cell().begin_parse());
+}
+
+int is_blacklisted(slice ip) inline {
+    var cs = storage_data.begin_parse();
+    cell blacklist = cs~load_ref();
+
+    ;; Eğer blacklist boşsa, `0` döndür
+    if (is_empty_cell(blacklist)) {
+        return 0; ;; false
+    }
+
+    ;; `slice` ile iterasyon yaparak kontrol et
+    var parser = blacklist.begin_parse();
+    while (not(parser.slice_empty?())) {
+        slice blacklisted_ip = parser~load_slice();
+        if (slice_hash(blacklisted_ip) == slice_hash(ip)) {
+            return 1; ;; true
+        }
+    }
+    return 0; ;; false
+}
+
+;; Blacklist güncelleme fonksiyonu
+() update_blacklist(slice ip, int is_add) inline {
+    var cs = storage_data.begin_parse();
+    cell blacklist = cs~load_ref();
+
+    ;; Yeni bir builder oluşturun
+    builder b = begin_cell();
+
+    ;; Eğer blacklist boşsa, yeni bir cell oluştur
+    if (is_empty_cell(blacklist)) {
+        if (is_add) {
+            b.store_slice(ip);
+        }
+    } else {
+        var parser = blacklist.begin_parse();
+        
+        ;; Slice boş değilse döngüye gir
+        while (not(parser.slice_empty?())) {
+            slice blacklisted_ip = parser~load_slice();
+            if ((not(is_add) & (slice_hash(blacklisted_ip) == slice_hash(ip))) | (is_add & not(slice_hash(blacklisted_ip) == slice_hash(ip)))) {
+                b.store_slice(blacklisted_ip);
+            }
+        }
+
+        ;; Eğer IP ekleyeceksek ve mevcut değilse, IP'yi güncellenmiş blacklist'e ekleyin
+        if (is_add) {
+            b.store_slice(ip);
+        }
+    }
+
+    ;; Güncellenmiş blacklist'i storage_data'ya kaydedin
+    storage_data = begin_cell()
+        .store_slice(cs~load_slice())
+        .store_uint(cs~load_uint(32), 32)
+        .store_uint(cs~load_uint(64), 64)
+        .store_ref(b.end_cell()) ;; Güncellenmiş blacklist
+        .store_uint(cs~load_uint(32), 32)
+        .store_uint(cs~load_uint(32), 32)
+        .store_uint(cs~load_uint(32), 32)
+        .store_ref(cs~load_ref())
+        .store_uint(cs~load_uint(32), 32)
+        .store_ref(cs~load_ref())
+        .end_cell();
+}
+
+;; Token kazanımını izleyip kontrol eden fonksiyon
+() trackTokenEarning(slice userIP, int tokens) impure {
+    int lastEarnTime = tokenEarnTime.get(userIP, 0);
+    int currentTime = now();
+
+    if (lastEarnTime != 0) {
+        int elapsedTime = currentTime - lastEarnTime;
+        if (elapsedTime > 0) {
+            int earnedTokens = tokenEarned.get(userIP, 0) + tokens;
+
+            ;; Limit kontrolü
+            int  adjustedLimit = limit * elapsedTime; ;; 600 token/saniye, hassasiyet için 1000 ile çarpıyoruz
+            int earnedTokensInMillis = earnedTokens * 1000; ;; token miktarını aynı hassasiyette hesaplıyoruz
+
+            if ( earnedTokensInMillis > adjustedLimit) {
+                update_blacklist(userIP, 1);
+            } else{
+                earnedTokens += tokens;
+            }
+        }
+    } else {
+        tokenEarned = tokenEarned.set(userIP, tokens);
+    }
+
+    tokenEarnTime = tokenEarnTime.set(userIP, currentTime);
+}
+
+;; Kullanıcıyı kara listeye ekleme fonksiyonu
+() addToBlacklist(slice userIP) impure {
+    checkAdmin(msg.caller());
+    update_blacklist(userIP, 1); ;; Kullanıcıyı kara listeye ekle
+}
+
+;; Reentrancy guard
+int reentrancy_guard() inline_ref {
+    var cs = storage_data.begin_parse();
+    return cs~load_uint(8) == 0;
+}
+
+() set_reentrancy_guard(int state) inline {
+    storage_data = begin_cell()
+        .store_uint(state ? 1 : 0, 8)
+        .end_cell();
+}
+
+;; Contract methods
+() init(slice admin_addr) impure {
+    storage_data = begin_cell()
+        .store_slice(admin_addr)
+        .store_uint(0, 32) ;; current_seqno
+        .store_uint(0, 64) ;; novacoin_balance
+        .store_ref(begin_cell().end_cell()) ;; user_data
+        .store_uint(INITIAL_ENERGY, 32) ;; energy
+        .store_uint(0, 32) ;; click_boost
+        .store_uint(0, 32) ;; energy_boost
+        .store_ref(begin_cell().end_cell()) ;; blacklist
+        .store_uint(0, 32) ;; last_airdrop
+        .store_ref(begin_cell().end_cell()) ;; staking_data
+        .end_cell();
+    set_reentrancy_guard(0);
+}
+
+() set_admin(slice new_admin) impure {
+    var cs = storage_data.begin_parse();
+    slice admin_addr = cs~load_slice();
+    throw_unless(admin_addr == get_sender_address(), 1);
+    storage_data = begin_cell()
+        .store_slice(new_admin)
+        .store_uint(cs~load_uint(32), 32)
+        .store_uint(cs~load_uint(64), 64)
+        .store_ref(cs~load_ref())
+        .store_uint(cs~load_uint(32), 32)
+        .store_uint(cs~load_uint(32), 32)
+        .store_uint(cs~load_uint(32), 32)
+        .store_ref(cs~load_ref())
+        .store_uint(cs~load_uint(32), 32)
+        .store_ref(cs~load_ref())
+        .end_cell();
+}
+
+() stake(int amount) impure {
+    throw_unless(amount > 0, 2);
+    var cs = storage_data.begin_parse();
+    int novacoin_balance = cs~load_uint(64);
+    throw_unless(amount <= novacoin_balance, 3);
+
+    ;; Stake işlemleri burada uygulanacak
+
+    storage_data = begin_cell()
+        .store_slice(cs~load_slice())
+        .store_uint(cs~load_uint(32), 32)
+        .store_uint(novacoin_balance - amount, 64)
+        .store_ref(cs~load_ref())
+        .store_uint(cs~load_uint(32), 32)
+        .store_uint(cs~load_uint(32), 32)
+        .store_uint(cs~load_uint(32), 32)
+        .store_ref(cs~load_ref())
+        .store_uint(cs~load_uint(32), 32)
+        .store_ref(cs~load_ref())
+        .end_cell();
+}
+
+() update_boost(int boost_cost, int boost_amount, int is_energy_boost) impure {
+    var cs = storage_data.begin_parse();
+    int novacoin_balance = cs~load_uint(64);
+    throw_unless(novacoin_balance >= boost_cost, is_energy_boost ? 4 : 5);
+    novacoin_balance -= boost_cost;
+    int energy_or_click_boost = cs~load_uint(32);
+    energy_or_click_boost += boost_amount;
+
+    storage_data = begin_cell()
+        .store_slice(cs~load_slice())
+        .store_uint(cs~load_uint(32), 32)
+        .store_uint(novacoin_balance, 64)
+        .store_ref(cs~load_ref())
+        .store_uint(is_energy_boost ? min(energy_or_click_boost, MAX_ENERGY) : energy_or_click_boost, 32)
+        .store_uint(cs~load_uint(32), 32)
+        .store_uint(cs~load_uint(32), 32)
+        .store_ref(cs~load_ref())
+        .store_uint(cs~load_uint(32), 32)
+        .store_ref(cs~load_ref())
+        .end_cell();
+}
+
+() recharge_energy() impure {
+    var cs = storage_data.begin_parse();
+    int energy = cs~load_uint(32);
+    int current_time = now();
+    if (energy < MAX_ENERGY) {
+        int last_recharge_time = cs~load_uint(32);
+        if (current_time - last_recharge_time >= ENERGY_RECHARGE_INTERVAL) {
+            energy = min(energy + 100, MAX_ENERGY);
+            storage_data = begin_cell()
+                .store_slice(cs~load_slice())
+                .store_uint(cs~load_uint(32), 32)
+                .store_uint(cs~load_uint(64), 64)
+                .store_ref(cs~load_ref())
+                .store_uint(energy, 32)
+                .store_uint(current_time, 32) ;; Son şarj zamanını güncelle
+                .store_uint(cs~load_uint(32), 32)
+                .store_uint(cs~load_uint(32), 32)
+                .store_ref(cs~load_ref())
+                .store_uint(cs~load_uint(32), 32)
+                .store_ref(cs~load_ref())
+                .end_cell();
+        }
+    }
+}
+
+
+() call(slice msg) {
+    var cs = storage_data.begin_parse();
+    int reentrancy = reentrancy_guard();
+    throw_unless(reentrancy == 0, 1);
+    set_reentrancy_guard(1);
+
+    ;; Function dispatch
+    if (msg.is_equal("init")) {
+        init(msg~load_slice());
+    } else {
+        if (msg.is_equal("set_admin")) {
+            set_admin(msg~load_slice());
+        } else {
+            if (msg.is_equal("stake")) {
+                stake(msg~load_int(64));
+            } else {
+                if (msg.is_equal("update_boost")) {
+                    update_boost(msg~load_int(32), msg~load_int(32), msg~load_int(1));
+                } else {
+                    if (msg.is_equal("recharge_energy")) {
+                        recharge_energy();
+                    } else {
+                        if (msg.is_equal("track_token_earning")) {
+                            trackTokenEarning(msg~load_slice(), msg~load_int(32));
+                        } else {
+                            if (msg.is_equal("add_to_blacklist")) {
+                                addToBlacklist(msg~load_slice());
+                            } else {
+                                throw_unless(0, 2); ;; unknown function
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    set_reentrancy_guard(0);
+}
+
